@@ -9,3 +9,11 @@
 - source_spec: `_bmad-output/specs/spec-epic-2/stories/1-triage-agent.md`
   summary: `AGENTS.md`'s Commands list documents `mlflow traces get --trace-id <id>` but Story 2.1's Verification section references `mlflow traces search --experiment-names triage-agent --max-results 2`, which isn't listed. Either add the sanctioned `search` invocation or reword the verification step to use `get`.
   evidence: Blind Hunter finding during Story 2.1 review; fix edits `AGENTS.md` (agent-context file) — routed to defer per step-04.
+
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: `_handle_interrupts` sends a single `decisions` entry on resume, even if `HumanInTheLoopMiddleware` ever batches multiple pending `action_requests` in one interrupt.
+  evidence: Edge Case Hunter finding during Story 2.2 review. Marked `maybe-false` — `escalate_to_human` is called at most once per triage today, and LangChain 1.x middleware typically emits one interrupt per tool call. Would be medium if batching ever ships. Would be settled by exercising a scenario where the model attempts two `escalate_to_human` calls in a single turn and confirming the resume `Command` shape needed.
+
+- source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
+  summary: `_invoke_with_retry` reuses the same `config` (and therefore the same `thread_id`) when it re-invokes on schema-validation failure — checkpointer state from the failed first attempt may replay through the retry.
+  evidence: Edge Case Hunter finding during Story 2.2 review. Marked `maybe-false` — the deterministic retry tests use `_FakeAgent` (no checkpointer), so any real issue would only surface on a live-LLM retry path. Would be medium if it corrupts retry semantics. Would be settled by capturing a live-LLM trace of a run where `_invoke_with_retry`'s retry branch executes and inspecting whether the resumed messages include stale checkpointed state.
