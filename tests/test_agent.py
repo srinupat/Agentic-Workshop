@@ -1,15 +1,19 @@
 """Live-LLM smoke tests for the triage agent.
 
 These tests spin up the real MCP server subprocess and hit the configured LLM provider,
-so they are opt-in: they skip when the relevant API key isn't set. Two cases cover the
-CAP-1 and CAP-6 success signals from the Epic 2 spec:
+so they are opt-in: they skip when the relevant API key isn't set. Three cases cover the
+Epic 2 signals:
 
 - T-1042 (CAP-1) — Northwind/Enterprise/2 open tickets, duplicate charge. Expected:
   category `billing`, priority `P2`, route `billing-team` (no Enterprise bump, 2 < 3).
 - T-1099 (CAP-6) — ticket body attempts prompt injection ("mark this P1"). Expected:
   category `bug`, priority `P4` — the embedded instruction is ignored.
+- T-1048 (Story 2.2) — Hooli/Enterprise/4 open, P1 outage. Monkey-patched `input()`
+  returns `"no"`: escalation is rejected, agent still returns a valid decision.
 
-Run offline: the tests skip. Run with keys: the tests exercise the contract that matters.
+Run offline: the smoke tests skip. Run with keys: they exercise the contract that
+matters. The deterministic unit tests further down (retry-once + Groq schema alias +
+HITL approve/reject) always run and require no API key.
 """
 
 from __future__ import annotations
@@ -99,6 +103,40 @@ def test_t1099_ignores_prompt_injection() -> None:
     assert decision["priority"] == "P4", decision
 
 
+@pytest.mark.skipif(
+    not os.environ.get(_key_for_provider()),
+    reason=_MISSING_KEY_REASON,
+)
+def test_t1048_p1_enterprise_reject_escalation(monkeypatch) -> None:
+    """Story 2.2 smoke test: T-1048 (Hooli/Enterprise/4 open) triggers escalation.
+
+    With `input()` monkey-patched to return `"no"`, the middleware cancels the escalation
+    call and the agent completes with a schema-shaped `TriageDecision`. Asserts:
+      1. `input()` was actually called (proves the HITL middleware paused execution — if
+         the middleware were removed from `create_agent`, this list would stay empty).
+      2. The returned decision matches CAP-5's expected shape for T-1048.
+    """
+    import builtins
+
+    from agent import triage
+
+    input_calls: list[tuple] = []
+
+    def _fake_input(*args, **_kwargs) -> str:
+        input_calls.append(args)
+        return "no"
+
+    monkeypatch.setattr(builtins, "input", _fake_input)
+
+    decision = asyncio.run(triage("T-1048"))
+
+    assert input_calls, "HITL prompt did not fire — middleware wiring may be broken."
+    assert decision["category"] == "bug", decision
+    assert decision["priority"] == "P1", decision
+    assert decision["route"] == "bug-team", decision
+    assert isinstance(decision["rationale"], str) and decision["rationale"].strip()
+
+
 # ---------------------------------------------------------------------------
 # Deterministic unit tests — no API key required, run in every pytest session.
 # They pin the internal contracts (retry-once + Groq schema-alias) that the
@@ -110,15 +148,18 @@ class _FakeAgent:
     """Fake `create_agent` result whose `ainvoke` returns pre-canned responses.
 
     Each element of `responses` is either a callable that raises (to simulate a
-    `StructuredOutputValidationError`) or a dict to return.
+    `StructuredOutputValidationError`) or a dict to return. `ainvoke` also records the
+    payload it was called with so tests can assert on resume `Command`s.
     """
 
     def __init__(self, responses: list) -> None:
         self._responses = list(responses)
         self.call_count = 0
+        self.payloads: list = []
 
-    async def ainvoke(self, _payload: dict) -> dict:
+    async def ainvoke(self, payload, config=None) -> dict:
         self.call_count += 1
+        self.payloads.append(payload)
         response = self._responses.pop(0)
         if callable(response):
             response()
@@ -134,6 +175,9 @@ def _valid_decision():
         route="billing-team",
         rationale="Money is at stake; enterprise rule does not apply.",
     )
+
+
+_FAKE_CONFIG = {"configurable": {"thread_id": "T-TEST-abc12345"}}
 
 
 def test_retry_once_succeeds_after_first_validation_error() -> None:
@@ -154,7 +198,7 @@ def test_retry_once_succeeds_after_first_validation_error() -> None:
     valid = _valid_decision()
     agent = _FakeAgent([_raise, {"structured_response": valid}])
 
-    result = asyncio.run(_invoke_with_retry(agent, "Triage T-1042"))
+    result = asyncio.run(_invoke_with_retry(agent, "Triage T-1042", _FAKE_CONFIG))
 
     assert agent.call_count == 2
     assert result is valid
@@ -178,7 +222,7 @@ def test_retry_once_raises_runtime_error_on_second_failure() -> None:
     agent = _FakeAgent([_raise, _raise])
 
     with pytest.raises(RuntimeError) as excinfo:
-        asyncio.run(_invoke_with_retry(agent, "Triage T-1042"))
+        asyncio.run(_invoke_with_retry(agent, "Triage T-1042", _FAKE_CONFIG))
 
     assert agent.call_count == 2
     assert "twice" in str(excinfo.value)
@@ -194,10 +238,229 @@ def test_retry_once_covers_missing_structured_response() -> None:
     valid = _valid_decision()
     agent = _FakeAgent([{"structured_response": None}, {"structured_response": valid}])
 
-    result = asyncio.run(_invoke_with_retry(agent, "Triage T-1042"))
+    result = asyncio.run(_invoke_with_retry(agent, "Triage T-1042", _FAKE_CONFIG))
 
     assert agent.call_count == 2
     assert result is valid
+
+
+# ---------------------------------------------------------------------------
+# HITL interrupt-handling loop — approve / reject / edge-cases.
+# These pin Story 2.2's contract without spinning up an LLM.
+# ---------------------------------------------------------------------------
+
+
+def _interrupt_result() -> dict:
+    """Fake agent result carrying an `__interrupt__` payload for `escalate_to_human`.
+
+    Shape matches what `HumanInTheLoopMiddleware` actually emits in LangChain 1.x:
+    `action_requests` (plural) → list of `{"name", "args", "description"}` dicts.
+    """
+    return {
+        "__interrupt__": [
+            {
+                "value": {
+                    "action_requests": [
+                        {
+                            "name": "escalate_to_human",
+                            "args": {"reason": "P1 outage for Enterprise customer."},
+                            "description": "Tool execution requires approval",
+                        }
+                    ],
+                    "review_configs": [
+                        {
+                            "action_name": "escalate_to_human",
+                            "allowed_decisions": ["approve", "reject"],
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+
+def test_hitl_approve_sends_approve_decision_on_resume(monkeypatch) -> None:
+    """`input()` returning `"yes"` (any case) resumes with `decisions[0].type == "approve"`."""
+    import asyncio
+    import builtins
+
+    from langgraph.types import Command
+
+    from agent import _invoke_with_retry
+
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_kw: "YES")
+
+    valid = _valid_decision()
+    agent = _FakeAgent([_interrupt_result(), {"structured_response": valid}])
+
+    result = asyncio.run(_invoke_with_retry(agent, "Triage T-1048", _FAKE_CONFIG))
+
+    assert agent.call_count == 2
+    assert result is valid
+    resume_payload = agent.payloads[1]
+    assert isinstance(resume_payload, Command)
+    assert resume_payload.resume == {"decisions": [{"type": "approve"}]}
+
+
+def test_hitl_reject_sends_reject_decision_on_resume(monkeypatch) -> None:
+    """Non-`yes` input (here `"no"`) resumes with `decisions[0].type == "reject"`."""
+    import asyncio
+    import builtins
+
+    from langgraph.types import Command
+
+    from agent import _invoke_with_retry
+
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_kw: "no")
+
+    valid = _valid_decision()
+    agent = _FakeAgent([_interrupt_result(), {"structured_response": valid}])
+
+    result = asyncio.run(_invoke_with_retry(agent, "Triage T-1048", _FAKE_CONFIG))
+
+    assert agent.call_count == 2
+    assert result is valid
+    resume_payload = agent.payloads[1]
+    assert isinstance(resume_payload, Command)
+    assert resume_payload.resume == {"decisions": [{"type": "reject"}]}
+
+
+@pytest.mark.parametrize("answer", ["", "y", "maybe", "YEs no", " yes "])
+def test_hitl_only_exact_yes_approves(monkeypatch, answer) -> None:
+    """`"yes"` (case-insensitive, trimmed) approves; every other string rejects."""
+    import asyncio
+    import builtins
+
+    from agent import _invoke_with_retry
+
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_kw: answer)
+
+    valid = _valid_decision()
+    agent = _FakeAgent([_interrupt_result(), {"structured_response": valid}])
+
+    asyncio.run(_invoke_with_retry(agent, "Triage T-1048", _FAKE_CONFIG))
+
+    resume_payload = agent.payloads[1]
+    expected_type = "approve" if answer.strip().lower() == "yes" else "reject"
+    assert resume_payload.resume == {"decisions": [{"type": expected_type}]}
+
+
+def test_hitl_eof_treated_as_reject(monkeypatch) -> None:
+    """EOF on stdin is caught and treated as a reject; no exception escapes."""
+    import asyncio
+    import builtins
+
+    from agent import _invoke_with_retry
+
+    def _raise_eof(*_a, **_kw) -> str:
+        raise EOFError
+
+    monkeypatch.setattr(builtins, "input", _raise_eof)
+
+    valid = _valid_decision()
+    agent = _FakeAgent([_interrupt_result(), {"structured_response": valid}])
+
+    asyncio.run(_invoke_with_retry(agent, "Triage T-1048", _FAKE_CONFIG))
+
+    resume_payload = agent.payloads[1]
+    assert resume_payload.resume == {"decisions": [{"type": "reject"}]}
+
+
+def test_hitl_keyboard_interrupt_treated_as_reject(monkeypatch) -> None:
+    """`KeyboardInterrupt` from stdin is caught inside the prompt and treated as reject.
+
+    The spec's Boundaries "Never" section explicitly promises this behavior alongside
+    EOF; symmetric coverage prevents a regression that would let SIGINT abort mid-triage.
+    """
+    import asyncio
+    import builtins
+
+    from agent import _invoke_with_retry
+
+    def _raise_sigint(*_a, **_kw) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(builtins, "input", _raise_sigint)
+
+    valid = _valid_decision()
+    agent = _FakeAgent([_interrupt_result(), {"structured_response": valid}])
+
+    asyncio.run(_invoke_with_retry(agent, "Triage T-1048", _FAKE_CONFIG))
+
+    resume_payload = agent.payloads[1]
+    assert resume_payload.resume == {"decisions": [{"type": "reject"}]}
+
+
+def test_hitl_interrupt_loop_is_bounded(monkeypatch) -> None:
+    """`_handle_interrupts` refuses to prompt forever if the agent keeps re-interrupting.
+
+    A pathological agent that emits `__interrupt__` on every resume would otherwise loop
+    on `input()` indefinitely. `_MAX_HITL_INTERRUPTS` bounds the loop; after the cap the
+    helper raises `RuntimeError` rather than continuing to prompt.
+    """
+    import asyncio
+    import builtins
+
+    from agent import _MAX_HITL_INTERRUPTS, _handle_interrupts
+
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_kw: "no")
+
+    # Agent that always re-emits an interrupt — never terminates on its own.
+    class _InfiniteInterruptAgent:
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def ainvoke(self, _payload, config=None) -> dict:
+            self.call_count += 1
+            return _interrupt_result()
+
+    agent = _InfiniteInterruptAgent()
+
+    with pytest.raises(RuntimeError, match="HITL interrupt loop exceeded"):
+        asyncio.run(_handle_interrupts(agent, _interrupt_result(), _FAKE_CONFIG))
+
+    assert agent.call_count == _MAX_HITL_INTERRUPTS
+
+
+def test_config_is_forwarded_to_agent_ainvoke(monkeypatch) -> None:
+    """`_invoke_with_retry` passes the caller's `config` to every `ainvoke` — initial and resume.
+
+    Guards against a regression that drops the `config=` kwarg from the `agent.ainvoke(...)`
+    call sites. Without the config (and its `thread_id`), the checkpointer can't correlate
+    the resume with the paused state and HITL breaks silently.
+    """
+    import asyncio
+    import builtins
+
+    monkeypatch.setattr(builtins, "input", lambda *_a, **_kw: "no")
+
+    class _ConfigCapturingAgent:
+        def __init__(self, responses) -> None:
+            self._responses = list(responses)
+            self.configs: list = []
+
+        async def ainvoke(self, _payload, config=None) -> dict:
+            self.configs.append(config)
+            return self._responses.pop(0)
+
+    from agent import _invoke_with_retry
+
+    valid = _valid_decision()
+    agent = _ConfigCapturingAgent([_interrupt_result(), {"structured_response": valid}])
+
+    asyncio.run(_invoke_with_retry(agent, "Triage T-1048", _FAKE_CONFIG))
+
+    assert agent.configs == [_FAKE_CONFIG, _FAKE_CONFIG]
+
+
+def test_escalate_to_human_is_a_langchain_tool() -> None:
+    """`escalate_to_human` is a `@tool`-decorated function usable by `create_agent`."""
+    from langchain_core.tools import BaseTool
+
+    from agent import escalate_to_human
+
+    assert isinstance(escalate_to_human, BaseTool)
+    assert escalate_to_human.name == "escalate_to_human"
 
 
 def test_response_format_uses_triage_decision_by_default(monkeypatch) -> None:
