@@ -17,3 +17,11 @@
 - source_spec: `_bmad-output/specs/spec-epic-2/stories/2-human-gated-escalation.md`
   summary: `_invoke_with_retry` reuses the same `config` (and therefore the same `thread_id`) when it re-invokes on schema-validation failure — checkpointer state from the failed first attempt may replay through the retry.
   evidence: Edge Case Hunter finding during Story 2.2 review. Marked `maybe-false` — the deterministic retry tests use `_FakeAgent` (no checkpointer), so any real issue would only surface on a live-LLM retry path. Would be medium if it corrupts retry semantics. Would be settled by capturing a live-LLM trace of a run where `_invoke_with_retry`'s retry branch executes and inspecting whether the resumed messages include stale checkpointed state.
+
+- source_spec: `_bmad-output/specs/spec-epic-3/stories/1-eval-run-and-code-scorers.md`
+  summary: `@mlflow.trace(span_type="AGENT")` on the predict wrapper is guarded only by a source-string grep. A source-preserving structural refactor that keeps both substrings but moves the decorator would silently break the "single trace per ticket" invariant `tool_order` depends on for escalating tickets.
+  evidence: Verification Gap Reviewer finding during Story 3.1 review. Marked `maybe-false`/`defer` — closing it requires a keyed live-LLM run asserting `tool_order == 1` on at least one escalating ticket (the resume half of the interrupt is the regression case). Blocked in this session by rate limits on both Gemini and Groq. Would be settled by a keyed live run against a non-rate-limited provider.
+
+- source_spec: `_bmad-output/specs/spec-epic-3/stories/1-eval-run-and-code-scorers.md`
+  summary: End-to-end eval run showing high (>0.9) scorer means and non-zero `Auto-approved escalations` was not observed this session — Groq free-tier rate limits made most `triage()` calls end in `ERROR` state during the manual verification, so the printed means were ~0.20 and the escalation count was 0.
+  evidence: Documented in Story 3.1's Implementation Notes "Rate-limit caveat". The harness itself is verified (every ticket appears, all four scorers ran without aborting, MLflow logged one run + traces, stdout summary printed cleanly). A re-run against paid/unrestricted Groq or a Gemini reset is needed to confirm the numeric AC-3 contract ("escalation_count matches P1+Enterprise count").
