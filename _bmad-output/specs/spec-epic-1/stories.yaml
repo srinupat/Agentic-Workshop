@@ -1,0 +1,14 @@
+- id: "1"
+  title: Triage decision schema
+  description: >-
+    Build the Python module Epic 2 imports to validate its structured output
+    (CAP-1): enum-constrained category, priority, and route plus a one-sentence
+    rationale, with a clear error naming the offending field on any invalid or
+    missing value.
+- id: "2"
+  title: Seed loader
+  description: >-
+    Build load_seed.py (CAP-2): read seed/tickets.csv and seed/customers.csv
+    and produce app.db with tables and columns matching what
+    mcp/triage_server.py already queries, idempotent so a second run yields
+    the same database.
