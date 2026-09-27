@@ -16,8 +16,10 @@ from dataclasses import dataclass, field
 import pytest
 
 from eval.run_eval import (
+    JudgeVerdict,
     category_match,
     priority_match,
+    rationale_judge,
     tool_order,
     valid_schema,
 )
@@ -335,4 +337,387 @@ def test_auto_approve_trigger_stays_in_sync_with_agent_prompt() -> None:
         f"agent.py's HITL prompt no longer contains the auto-approve trigger "
         f"substring {trigger_substring!r}. Either update the trigger in "
         f"eval/run_eval.py::_auto_approve_input or restore the prompt text."
+    )
+
+
+# ---------------------------------------------------------------------------
+# `rationale_judge` — deterministic unit tests with a fake judge model
+# ---------------------------------------------------------------------------
+
+
+class _FakeJudgeModel:
+    """Minimal `.invoke(messages) -> JudgeVerdict` stub for the rationale judge tests.
+
+    Monkey-patched in for `_judge_model()` so the scorer's control flow can be exercised
+    without any Groq API call.
+    """
+
+    def __init__(self, verdict: str = "pass", reason: str = "matches the rubric") -> None:
+        self._verdict = verdict
+        self._reason = reason
+        self.calls: list = []
+
+    def invoke(self, messages):  # noqa: ANN001
+        self.calls.append(messages)
+        return JudgeVerdict(verdict=self._verdict, reason=self._reason)  # type: ignore[arg-type]
+
+
+class _RaisingJudgeModel:
+    def invoke(self, messages):  # noqa: ANN001, ARG002
+        raise RuntimeError("simulated groq failure")
+
+
+def test_rationale_judge_pass_returns_feedback_true(monkeypatch) -> None:
+    """A `"pass"` verdict maps to `Feedback(value=True, rationale=<reason>)`."""
+    from eval import run_eval
+
+    fake = _FakeJudgeModel(verdict="pass", reason="money at stake — P2 is correct")
+    monkeypatch.setattr(run_eval, "_judge_model", lambda: fake)
+
+    fb = rationale_judge(
+        outputs=_valid_payload(),
+        expectations={"judge_notes": "Double charge → money problem → P2."},
+    )
+    assert fb.value is True
+    assert fb.rationale == "money at stake — P2 is correct"
+    assert len(fake.calls) == 1  # judge was actually consulted
+
+
+def test_rationale_judge_fail_returns_feedback_false(monkeypatch) -> None:
+    """A `"fail"` verdict maps to `Feedback(value=False, rationale=<reason>)`."""
+    from eval import run_eval
+
+    fake = _FakeJudgeModel(verdict="fail", reason="rationale contradicts judge_notes")
+    monkeypatch.setattr(run_eval, "_judge_model", lambda: fake)
+
+    fb = rationale_judge(
+        outputs=_valid_payload(),
+        expectations={"judge_notes": "Should have been P3."},
+    )
+    assert fb.value is False
+    assert fb.rationale == "rationale contradicts judge_notes"
+
+
+def test_rationale_judge_handles_missing_rationale_without_calling_model(monkeypatch) -> None:
+    """Missing/empty agent rationale returns a canned Feedback without invoking the judge."""
+    from eval import run_eval
+
+    fake = _FakeJudgeModel()
+    monkeypatch.setattr(run_eval, "_judge_model", lambda: fake)
+
+    payload = _valid_payload()
+    del payload["rationale"]
+
+    fb = rationale_judge(
+        outputs=payload,
+        expectations={"judge_notes": "anything"},
+    )
+    assert fb.value is False
+    assert fb.rationale == "no rationale to judge"
+    assert fake.calls == []  # judge model was NOT consulted
+
+
+def test_rationale_judge_handles_empty_rationale_string(monkeypatch) -> None:
+    """An empty-string `rationale` is also "no rationale to judge"."""
+    from eval import run_eval
+
+    fake = _FakeJudgeModel()
+    monkeypatch.setattr(run_eval, "_judge_model", lambda: fake)
+
+    payload = _valid_payload()
+    payload["rationale"] = ""
+
+    fb = rationale_judge(outputs=payload, expectations={"judge_notes": "x"})
+    assert fb.value is False
+    assert fb.rationale == "no rationale to judge"
+    assert fake.calls == []
+
+
+def test_rationale_judge_wraps_model_error_as_feedback_false(monkeypatch) -> None:
+    """A model call error returns Feedback(value=False, rationale='judge error: …')."""
+    from eval import run_eval
+
+    monkeypatch.setattr(run_eval, "_judge_model", lambda: _RaisingJudgeModel())
+
+    fb = rationale_judge(
+        outputs=_valid_payload(),
+        expectations={"judge_notes": "anything"},
+    )
+    assert fb.value is False
+    assert fb.rationale.startswith("judge error: ")
+    assert "simulated groq failure" in fb.rationale
+
+
+def test_rationale_judge_non_dict_outputs_return_no_rationale(monkeypatch) -> None:
+    """Totally-wrong `outputs` shape falls through to the missing-rationale branch."""
+    from eval import run_eval
+
+    fake = _FakeJudgeModel()
+    monkeypatch.setattr(run_eval, "_judge_model", lambda: fake)
+
+    fb = rationale_judge(outputs=None, expectations={"judge_notes": "x"})
+    assert fb.value is False
+    assert fb.rationale == "no rationale to judge"
+
+
+# ---------------------------------------------------------------------------
+# `_agent_total_tokens` — synthetic traces
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _StubSpanForToken:
+    """Minimal Span shape for `_agent_total_tokens` — needs `parent_id` and `span_type`."""
+
+    parent_id: str | None
+    span_type: str
+    name: str = "root"
+
+
+@dataclass
+class _StubTraceInfo:
+    token_usage: dict[str, int] | None
+
+
+@dataclass
+class _StubTraceData:
+    spans: list
+
+
+@dataclass
+class _StubTraceForToken:
+    """Stub of `mlflow.entities.Trace` with `.info.token_usage` and `.data.spans`."""
+
+    info: _StubTraceInfo
+    data: _StubTraceData
+
+
+def _make_trace(root_span_type: str, total_tokens: int | None) -> _StubTraceForToken:
+    root = _StubSpanForToken(parent_id=None, span_type=root_span_type, name="predict")
+    child = _StubSpanForToken(parent_id="root", span_type="TOOL", name="get_ticket")
+    usage = None if total_tokens is None else {"total_tokens": total_tokens}
+    return _StubTraceForToken(
+        info=_StubTraceInfo(token_usage=usage),
+        data=_StubTraceData(spans=[root, child]),
+    )
+
+
+def test_agent_total_tokens_sums_only_agent_rooted_traces(monkeypatch) -> None:
+    """AGENT-rooted traces contribute; non-AGENT (e.g. judge CHAT_MODEL) traces do not."""
+    from eval import run_eval
+
+    traces = [
+        _make_trace("AGENT", 100),
+        _make_trace("AGENT", 250),
+        _make_trace("CHAT_MODEL", 500),  # judge trace — must be excluded
+    ]
+    monkeypatch.setattr(
+        run_eval.mlflow,
+        "search_traces",
+        lambda run_id, return_type: traces,
+    )
+
+    assert run_eval._agent_total_tokens("abc") == 350
+
+
+def test_agent_total_tokens_tolerates_missing_usage(monkeypatch) -> None:
+    """Traces whose `token_usage` is None (errored before autolog) contribute 0."""
+    from eval import run_eval
+
+    traces = [
+        _make_trace("AGENT", 100),
+        _make_trace("AGENT", None),  # no usage recorded
+        _make_trace("AGENT", 50),
+    ]
+    monkeypatch.setattr(
+        run_eval.mlflow,
+        "search_traces",
+        lambda run_id, return_type: traces,
+    )
+
+    assert run_eval._agent_total_tokens("abc") == 150
+
+
+def test_agent_total_tokens_returns_zero_when_no_agent_rooted_traces(monkeypatch) -> None:
+    from eval import run_eval
+
+    traces = [
+        _make_trace("CHAT_MODEL", 500),
+        _make_trace("CHAT_MODEL", 750),
+    ]
+    monkeypatch.setattr(
+        run_eval.mlflow,
+        "search_traces",
+        lambda run_id, return_type: traces,
+    )
+
+    assert run_eval._agent_total_tokens("abc") == 0
+
+
+def test_agent_total_tokens_falls_back_to_input_plus_output_when_total_missing(monkeypatch) -> None:
+    """Some providers autolog `input_tokens` + `output_tokens` without `total_tokens`.
+
+    Falling back to the sum avoids silently reporting 0 when the underlying provider
+    just uses different field names.
+    """
+    from eval import run_eval
+
+    trace = _StubTraceForToken(
+        info=_StubTraceInfo(token_usage={"input_tokens": 10, "output_tokens": 5}),  # no total
+        data=_StubTraceData(spans=[_StubSpanForToken(parent_id=None, span_type="AGENT")]),
+    )
+    monkeypatch.setattr(
+        run_eval.mlflow,
+        "search_traces",
+        lambda run_id, return_type: [trace],
+    )
+
+    assert run_eval._agent_total_tokens("abc") == 15
+
+
+def test_agent_total_tokens_returns_zero_when_all_keys_missing(monkeypatch) -> None:
+    """An empty `token_usage` dict contributes 0 (no components to sum)."""
+    from eval import run_eval
+
+    trace = _StubTraceForToken(
+        info=_StubTraceInfo(token_usage={}),
+        data=_StubTraceData(spans=[_StubSpanForToken(parent_id=None, span_type="AGENT")]),
+    )
+    monkeypatch.setattr(
+        run_eval.mlflow,
+        "search_traces",
+        lambda run_id, return_type: [trace],
+    )
+
+    assert run_eval._agent_total_tokens("abc") == 0
+
+
+# ---------------------------------------------------------------------------
+# `_write_report`
+# ---------------------------------------------------------------------------
+
+
+def test_write_report_produces_pretty_json_with_trailing_newline(tmp_path) -> None:
+    from eval.run_eval import _write_report
+
+    path = tmp_path / "latest_report.json"
+    report = {
+        "run_id": "abc123",
+        "scorer_means": {
+            "valid_schema": 1.0,
+            "category_match": 0.9,
+            "priority_match": 0.85,
+            "tool_order": 1.0,
+            "rationale_judge": 0.75,
+        },
+        "agent_total_tokens": 12345,
+        "escalation_count": 3,
+    }
+
+    _write_report(path, report)
+
+    text = path.read_text(encoding="utf-8")
+    assert text.endswith("\n"), "Report file must end with a trailing newline."
+    # Round-trips as JSON.
+    import json as _json
+
+    loaded = _json.loads(text)
+    assert loaded == report
+    # Pretty-printed (indent=2) → contains newlines and 2-space indent.
+    assert "\n  " in text
+
+
+def test_write_report_overwrites_existing_file(tmp_path) -> None:
+    from eval.run_eval import _write_report
+
+    path = tmp_path / "latest_report.json"
+    path.write_text('{"stale": true}\n', encoding="utf-8")
+
+    _write_report(path, {"fresh": True})
+
+    import json as _json
+
+    assert _json.loads(path.read_text(encoding="utf-8")) == {"fresh": True}
+
+
+# ---------------------------------------------------------------------------
+# Source-level guard: rationale_judge must NEVER read GEMINI_API_KEY
+# ---------------------------------------------------------------------------
+
+
+def test_run_eval_source_does_not_reference_gemini_api_key() -> None:
+    """Story 3.2 boundary: the judge model must never touch `GEMINI_API_KEY`.
+
+    Guard the boundary structurally — a grep on the module's source is the cheapest
+    way to catch a future refactor that copy-pastes `os.environ["GEMINI_API_KEY"]`
+    into the judge construction path.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "eval" / "run_eval.py").read_text(
+        encoding="utf-8"
+    )
+    assert "GEMINI_API_KEY" not in src, (
+        "eval/run_eval.py mentions GEMINI_API_KEY — the rationale_judge scorer must "
+        "only ever read GROQ_API_KEY / JUDGE_MODEL. Remove the reference."
+    )
+
+
+# ---------------------------------------------------------------------------
+# `_scorers()` registration guard
+# ---------------------------------------------------------------------------
+
+
+def test_scorers_registration_includes_all_five() -> None:
+    """`main()` wires up exactly the five scorers Story 3.2 requires."""
+    from eval.run_eval import _scorers
+
+    names = {getattr(s, "name", getattr(s, "__name__", None)) for s in _scorers()}
+    # `@scorer` wraps the function but preserves the underlying name via `.name` or
+    # via the wrapped `__name__`; accept either.
+    assert names >= {
+        "valid_schema",
+        "category_match",
+        "priority_match",
+        "tool_order",
+        "rationale_judge",
+    }, f"Missing scorers in registration: {names}"
+
+
+# ---------------------------------------------------------------------------
+# `main()` fail-fast on missing GROQ_API_KEY
+# ---------------------------------------------------------------------------
+
+
+def test_main_exits_when_groq_api_key_missing(monkeypatch) -> None:
+    """`main()` must SystemExit before touching MLflow / evaluate when GROQ_API_KEY is unset.
+
+    The judge always runs, no matter what `PROVIDER` is, so surfacing the config gap
+    upfront prevents a half-scored run + a stale report on disk.
+    """
+    import pytest as _pytest
+
+    from eval import run_eval
+
+    # Neutralize load_dotenv so a developer's .env file doesn't accidentally provide
+    # the key and mask the failure.
+    monkeypatch.setattr(run_eval, "load_dotenv", lambda *a, **kw: None)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+    # If evaluate is reached, the test failed — trip a loud error so the failure mode
+    # is unambiguous.
+    def _should_not_run(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("mlflow.genai.evaluate was called despite missing GROQ_API_KEY.")
+
+    monkeypatch.setattr(run_eval.mlflow.genai, "evaluate", _should_not_run)
+
+    with _pytest.raises(SystemExit) as excinfo:
+        run_eval.main()
+
+    assert "GROQ_API_KEY" in str(excinfo.value)
+    # A `SystemExit("msg")` defaults to code 1, but the assertion above alone would
+    # pass on `SystemExit(0)` — pin the non-zero exit so the failure actually surfaces
+    # to the shell.
+    assert excinfo.value.code not in (0, None), (
+        f"Expected a non-zero SystemExit code; got {excinfo.value.code!r}."
     )
