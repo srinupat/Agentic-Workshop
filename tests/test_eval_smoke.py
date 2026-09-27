@@ -4,14 +4,18 @@ Runs the full 20-ticket eval end-to-end on Groq (the workshop-realistic choice �
 free-tier is 20 requests/day and this eval fires 20-40 model calls). Skipped when
 `GROQ_API_KEY` is unset, so a keyless CI run stays green.
 
-The smoke test asserts three properties any regression would break:
+The smoke test asserts:
 
 1. `results.tables["eval_results"]` — the per-row DataFrame MLflow exposes with each
-   ticket's inputs, outputs, expectations and scorer values — has 20 rows.
-2. All four scorer columns are present in the per-row table.
+   ticket's inputs, outputs, expectations and scorer values — has 20 distinct tickets.
+2. All five scorer means (`valid_schema`, `category_match`, `priority_match`,
+   `tool_order`, `rationale_judge`) are present in `results.metrics`.
 3. The auto-approved escalation counter matches the number of P1+Enterprise tickets
    the seed data marks as needing escalation (`T-1044`, `T-1048`, `T-1057` at
    minimum — three).
+4. `eval/latest_report.json` exists on disk after the run and its numbers are
+   byte-identical to `results.metrics`, the auto-approved escalation count printed to
+   stdout, and the agent-total-tokens number printed to stdout.
 """
 
 from __future__ import annotations
@@ -97,24 +101,60 @@ def test_eval_run_end_to_end_on_groq(monkeypatch, capsys) -> None:
         # Fallback if MLflow renames the column: at least one row per ticket.
         assert len(per_row) >= 20, f"Expected >= 20 rows, got {len(per_row)}."
 
-    # All four scorer means show up in the aggregate metrics.
+    # All FIVE scorer means show up in the aggregate metrics (four code scorers +
+    # rationale_judge from Story 3.2).
     metrics = results.metrics or {}
-    for scorer_name in ("valid_schema", "category_match", "priority_match", "tool_order"):
+    scorer_names = (
+        "valid_schema",
+        "category_match",
+        "priority_match",
+        "tool_order",
+        "rationale_judge",
+    )
+    for scorer_name in scorer_names:
         assert f"{scorer_name}/mean" in metrics, (
             f"Missing `{scorer_name}/mean` in results.metrics: {sorted(metrics)}"
         )
 
-    # Auto-approved escalation count: printed in the stdout summary. Use a regex so
-    # trailing whitespace, extra padding, or a future "(of N tickets)" suffix don't
-    # break the extraction the way a bare `split(":")` would.
+    # Auto-approved escalation count + agent total tokens: both are printed in the
+    # stdout summary. Use regexes so trailing whitespace, extra padding, or a future
+    # "(of N tickets)" suffix don't break the extraction the way a bare `split(":")`
+    # would.
     import re
 
     stdout = capsys.readouterr().out
-    match = re.search(r"Auto-approved escalations:\s*(\d+)", stdout)
-    assert match, "Auto-approved escalations line missing from stdout."
-    escalations = int(match.group(1))
+    esc_match = re.search(r"Auto-approved escalations:\s*(\d+)", stdout)
+    assert esc_match, "Auto-approved escalations line missing from stdout."
+    escalations = int(esc_match.group(1))
+
+    tok_match = re.search(r"Agent total tokens:\s*(\d+)", stdout)
+    assert tok_match, "Agent total tokens line missing from stdout."
+    stdout_tokens = int(tok_match.group(1))
 
     assert escalations >= _EXPECTED_P1_ENTERPRISE_ESCALATIONS, (
         f"Expected at least {_EXPECTED_P1_ENTERPRISE_ESCALATIONS} P1+Enterprise "
         f"escalations (T-1044, T-1048, T-1057); got {escalations}."
     )
+
+    # `eval/latest_report.json` must exist and match the same numbers stdout printed
+    # and `results.metrics` reported. Single source of truth: no divergence allowed.
+    import json
+
+    report_path = _REPO_ROOT / "eval" / "latest_report.json"
+    assert report_path.exists(), "eval/latest_report.json was not written."
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert set(report) == {"run_id", "scorer_means", "agent_total_tokens", "escalation_count"}, (
+        f"Report top-level keys mismatch: {sorted(report)}"
+    )
+    assert report["run_id"] == results.run_id
+    assert report["escalation_count"] == escalations
+    assert report["agent_total_tokens"] == stdout_tokens
+    assert set(report["scorer_means"]) == set(scorer_names), (
+        f"scorer_means keys mismatch: {sorted(report['scorer_means'])}"
+    )
+    # Byte-identical numbers between the report and the aggregate metrics.
+    for name in scorer_names:
+        assert report["scorer_means"][name] == float(metrics[f"{name}/mean"]), (
+            f"Report `{name}` mean diverges from results.metrics."
+        )
